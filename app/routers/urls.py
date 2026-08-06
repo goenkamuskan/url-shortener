@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
-
+import json
 from app.core.database import get_db
 from app.core.encoding import encode_base62
 from app.core.config import BASE_URL
@@ -12,6 +12,18 @@ from app.core.rate_limiter import is_allowed
 
 from sqlalchemy import func as sql_func
 from app.schemas import AnalyticsResponse, ClickByDay, ReferrerCount
+from fastapi import APIRouter, Depends, HTTPException, Request, BackgroundTasks
+
+
+def log_click(url_id: int, referrer: str | None, user_agent: str | None):
+    from app.core.database import SessionLocal
+    db = SessionLocal()
+    try:
+        click = Click(url_id=url_id, referrer=referrer, user_agent=user_agent)
+        db.add(click)
+        db.commit()
+    finally:
+        db.close()
 
 router = APIRouter()
 
@@ -36,7 +48,10 @@ def shorten_url(payload: ShortenRequest, request: Request, db: Session = Depends
     new_url.short_code = encode_base62(new_url.id)
     db.commit()
 
-    redis_client.setex(f"url:{new_url.short_code}", 3600, new_url.long_url)
+    redis_client.setex(
+    f"url:{new_url.short_code}", 3600,
+    json.dumps({"long_url": new_url.long_url, "url_id": new_url.id})
+    )
 
     return ShortenResponse(
         short_code=new_url.short_code,
@@ -90,32 +105,35 @@ def get_analytics(code: str, db: Session = Depends(get_db)):
     )
 
 @router.get("/{code}")
-def redirect_to_long_url(code: str, request: Request, db: Session = Depends(get_db)):
+def redirect_to_long_url(
+    code: str,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
     cache_key = f"url:{code}"
+    cached = redis_client.get(cache_key)
 
-    # 1. Check Redis first
-    cached_url = redis_client.get(cache_key)
-    if cached_url:
-        long_url = cached_url
+    if cached:
+        data = json.loads(cached)
+        long_url = data["long_url"]
+        url_id = data["url_id"]
     else:
-        # 2. Cache miss — query Postgres
         url_entry = db.query(URL).filter(URL.short_code == code).first()
         if not url_entry:
             raise HTTPException(status_code=404, detail="Short URL not found")
         long_url = url_entry.long_url
-
-        # 3. Populate cache for next time (1 hour TTL)
-        redis_client.setex(cache_key, 3600, long_url)
-
-    # Log the click regardless of cache hit/miss — analytics still needs DB truth
-    url_id_row = db.query(URL.id).filter(URL.short_code == code).first()
-    if url_id_row:
-        click = Click(
-            url_id=url_id_row[0],
-            referrer=request.headers.get("referer"),
-            user_agent=request.headers.get("user-agent"),
+        url_id = url_entry.id
+        redis_client.setex(
+            cache_key, 3600,
+            json.dumps({"long_url": long_url, "url_id": url_id})
         )
-        db.add(click)
-        db.commit()
+
+    background_tasks.add_task(
+        log_click,
+        url_id,
+        request.headers.get("referer"),
+        request.headers.get("user-agent"),
+    )
 
     return RedirectResponse(url=long_url)
