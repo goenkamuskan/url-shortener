@@ -10,6 +10,9 @@ from app.schemas import ShortenRequest, ShortenResponse
 from app.core.redis_client import redis_client
 from app.core.rate_limiter import is_allowed
 
+from sqlalchemy import func as sql_func
+from app.schemas import AnalyticsResponse, ClickByDay, ReferrerCount
+
 router = APIRouter()
 
 
@@ -39,6 +42,51 @@ def shorten_url(payload: ShortenRequest, request: Request, db: Session = Depends
         short_code=new_url.short_code,
         short_url=f"{BASE_URL}/{new_url.short_code}",
         long_url=new_url.long_url,
+    )
+
+@router.get("/analytics/{code}", response_model=AnalyticsResponse)
+def get_analytics(code: str, db: Session = Depends(get_db)):
+    url_entry = db.query(URL).filter(URL.short_code == code).first()
+    if not url_entry:
+        raise HTTPException(status_code=404, detail="Short URL not found")
+
+    total_clicks = db.query(Click).filter(Click.url_id == url_entry.id).count()
+
+    clicks_by_day_raw = (
+        db.query(
+            sql_func.date(Click.clicked_at).label("day"),
+            sql_func.count(Click.id).label("count"),
+        )
+        .filter(Click.url_id == url_entry.id)
+        .group_by(sql_func.date(Click.clicked_at))
+        .order_by(sql_func.date(Click.clicked_at))
+        .all()
+    )
+    clicks_by_day = [
+        ClickByDay(date=str(row.day), count=row.count) for row in clicks_by_day_raw
+    ]
+
+    top_referrers_raw = (
+        db.query(
+            Click.referrer,
+            sql_func.count(Click.id).label("count"),
+        )
+        .filter(Click.url_id == url_entry.id)
+        .group_by(Click.referrer)
+        .order_by(sql_func.count(Click.id).desc())
+        .limit(5)
+        .all()
+    )
+    top_referrers = [
+        ReferrerCount(referrer=row.referrer, count=row.count) for row in top_referrers_raw
+    ]
+
+    return AnalyticsResponse(
+        short_code=url_entry.short_code,
+        long_url=url_entry.long_url,
+        total_clicks=total_clicks,
+        clicks_by_day=clicks_by_day,
+        top_referrers=top_referrers,
     )
 
 @router.get("/{code}")
