@@ -8,19 +8,31 @@ from app.core.config import BASE_URL
 from app.models import URL, Click
 from app.schemas import ShortenRequest, ShortenResponse
 from app.core.redis_client import redis_client
+from app.core.rate_limiter import is_allowed
+
 router = APIRouter()
 
 
+
 @router.post("/shorten", response_model=ShortenResponse)
-def shorten_url(payload: ShortenRequest, db: Session = Depends(get_db)):
+def shorten_url(payload: ShortenRequest, request: Request, db: Session = Depends(get_db)):
+    client_ip = request.client.host
+
+    if not is_allowed(client_ip):
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded. Try again shortly.",
+            headers={"Retry-After": "1"},
+        )
+
     new_url = URL(long_url=str(payload.long_url))
     db.add(new_url)
     db.commit()
-    db.refresh(new_url)  # populates new_url.id from the DB
+    db.refresh(new_url)
 
     new_url.short_code = encode_base62(new_url.id)
     db.commit()
-    
+
     redis_client.setex(f"url:{new_url.short_code}", 3600, new_url.long_url)
 
     return ShortenResponse(
@@ -28,7 +40,6 @@ def shorten_url(payload: ShortenRequest, db: Session = Depends(get_db)):
         short_url=f"{BASE_URL}/{new_url.short_code}",
         long_url=new_url.long_url,
     )
-
 
 @router.get("/{code}")
 def redirect_to_long_url(code: str, request: Request, db: Session = Depends(get_db)):
